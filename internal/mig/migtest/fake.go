@@ -18,17 +18,36 @@ import (
 
 var _ mig.API = (*Fake)(nil)
 
-// Fake: createInstances registers a pending managed instance; after
-// CreateAfterPolls calls to ListManaged the VM appears in Zone.
-type Fake struct {
-	mu               sync.Mutex
+// DefaultRegion is where New puts its MIGs.
+const DefaultRegion = "us-central1"
+
+// Region is the fake's behaviour in one region (see Fake).
+type Region struct {
 	Zone             string
 	CreateAfterPolls int    // -1 = never (no capacity)
 	AttemptError     string // reported as the MIG's last attempt error
-	SetLabelsFails   int    // number of SetLabels calls that fail before succeeding
-	MIGs             map[string]*computepb.InstanceGroupManager
+	// CreateError fails createInstances after the per-instance config was
+	// stored, like an operation that errors after partly applying.
+	CreateError string
+}
 
-	polls           int
+// Fake: createInstances registers a pending managed instance; after
+// CreateAfterPolls calls to ListManaged (in that region) the VM appears in
+// Zone. Zone, CreateAfterPolls and AttemptError apply to regions without an
+// entry in Regions.
+type Fake struct {
+	mu               sync.Mutex
+	Zone             string
+	CreateAfterPolls int
+	AttemptError     string
+	Regions          map[string]Region
+	SetLabelsFails   int                                        // number of SetLabels calls that fail before succeeding
+	MIGs             map[string]*computepb.InstanceGroupManager // keyed "region/name"
+	RegionList       []string                                   // returned by ListRegions
+	Countries        map[string]string                          // returned by RegionCountries
+	CountryCalls     int
+
+	polls           map[string]int
 	CreatedMetadata map[string]map[string]string
 	Managed         map[string]*computepb.ManagedInstance
 	Instances       map[string]*computepb.Instance
@@ -53,22 +72,51 @@ func SafeMIG(name string) *computepb.InstanceGroupManager {
 func New(migNames ...string) *Fake {
 	f := &Fake{
 		Zone:            "us-central1-b",
+		Regions:         map[string]Region{},
 		MIGs:            map[string]*computepb.InstanceGroupManager{},
+		polls:           map[string]int{},
 		CreatedMetadata: map[string]map[string]string{},
 		Managed:         map[string]*computepb.ManagedInstance{},
 		Instances:       map[string]*computepb.Instance{},
 		Configs:         map[string]bool{},
 	}
 	for _, n := range migNames {
-		f.MIGs[n] = SafeMIG(n)
+		f.MIGs[DefaultRegion+"/"+n] = SafeMIG(n)
 	}
 	return f
+}
+
+// AddMIG adds a safe MIG in region, with the fake's behaviour there.
+func (f *Fake) AddMIG(region, name string, behaviour Region) *computepb.InstanceGroupManager {
+	f.MIGs[region+"/"+name] = SafeMIG(name)
+	f.Regions[region] = behaviour
+	return f.MIGs[region+"/"+name]
+}
+
+func (f *Fake) region(name string) Region {
+	if r, ok := f.Regions[name]; ok {
+		return r
+	}
+	return Region{Zone: f.Zone, CreateAfterPolls: f.CreateAfterPolls, AttemptError: f.AttemptError}
+}
+
+func (f *Fake) ListRegions(_ context.Context, project string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.RegionList...), nil
+}
+
+func (f *Fake) RegionCountries(_ context.Context, project string) (map[string]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.CountryCalls++
+	return f.Countries, nil
 }
 
 func (f *Fake) GetMIG(_ context.Context, project, region, name string) (*computepb.InstanceGroupManager, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	igm, ok := f.MIGs[name]
+	igm, ok := f.MIGs[region+"/"+name]
 	if !ok {
 		return nil, mig.ErrNotFound
 	}
@@ -80,6 +128,10 @@ func (f *Fake) CreateInstance(_ context.Context, project, region, migName, name 
 	defer f.mu.Unlock()
 	if _, exists := f.Managed[name]; exists {
 		return fmt.Errorf("409 instance %s already exists", name)
+	}
+	if r, ok := f.Regions[region]; ok && r.CreateError != "" {
+		f.Configs[name] = true
+		return errors.New(r.CreateError)
 	}
 	f.CreatedMetadata[name] = metadata
 	f.Configs[name] = true
@@ -94,23 +146,27 @@ func (f *Fake) CreateInstance(_ context.Context, project, region, migName, name 
 func (f *Fake) ListManaged(_ context.Context, project, region, migName string) ([]*computepb.ManagedInstance, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.polls++
+	f.polls[region]++
+	r := f.region(region)
 	var out []*computepb.ManagedInstance
 	for name, mi := range f.Managed {
-		url := fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/zones/%s/instances/%s", project, f.Zone, name)
-		if f.AttemptError != "" {
+		if mi.GetVersion().GetName() != region+"/"+migName {
+			continue // another MIG's member
+		}
+		url := fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/zones/%s/instances/%s", project, r.Zone, name)
+		if r.AttemptError != "" {
 			mi.Instance = proto.String(url)
 			mi.LastAttempt = &computepb.ManagedInstanceLastAttempt{Errors: &computepb.ManagedInstanceLastAttemptErrors{
-				Errors: []*computepb.Errors{{Code: proto.String("ZONE_RESOURCE_POOL_EXHAUSTED"), Message: proto.String(f.AttemptError)}},
+				Errors: []*computepb.Errors{{Code: proto.String("ZONE_RESOURCE_POOL_EXHAUSTED"), Message: proto.String(r.AttemptError)}},
 			}}
 		}
-		if f.CreateAfterPolls >= 0 && f.polls > f.CreateAfterPolls && f.Instances[name] == nil {
+		if r.CreateAfterPolls >= 0 && f.polls[region] > r.CreateAfterPolls && f.Instances[name] == nil {
 			mi.Instance = proto.String(url)
 			mi.InstanceStatus = proto.String("PROVISIONING")
 			mi.CurrentAction = proto.String("NONE")
 			f.Instances[name] = &computepb.Instance{
 				Name:             proto.String(name),
-				Zone:             proto.String(fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/zones/%s", project, f.Zone)),
+				Zone:             proto.String(fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/zones/%s", project, r.Zone)),
 				Status:           proto.String("PROVISIONING"),
 				Labels:           map[string]string{"managed-by": "garm"}, // from the template
 				LabelFingerprint: proto.String("fp"),
@@ -180,10 +236,11 @@ func (f *Fake) SetLabels(_ context.Context, project, zone, name, fingerprint str
 func (f *Fake) ListInstances(_ context.Context, project, filter string) ([]*computepb.Instance, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	byLabel := strings.HasPrefix(filter, "labels.")
 	key, value, _ := strings.Cut(strings.TrimPrefix(filter, "labels."), "=")
 	var out []*computepb.Instance
 	for _, inst := range f.Instances {
-		if inst.Labels[key] == value {
+		if (byLabel && inst.Labels[key] == value) || (!byLabel && key == "name" && inst.GetName() == value) {
 			out = append(out, proto.Clone(inst).(*computepb.Instance))
 		}
 	}
