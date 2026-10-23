@@ -140,8 +140,22 @@ func TestNeverTouchesForeignVMs(t *testing.T) {
 	assert.ErrorIs(t, m.Delete(context.Background(), "us-central1-a/zonal-mig-member"), mig.ErrNotMIGManaged)
 	_, err := m.Get(context.Background(), "us-central1-a/standalone")
 	assert.ErrorIs(t, err, mig.ErrNotMIGManaged)
-	assert.Error(t, m.Delete(context.Background(), "not-a-provider-id"))
 	assert.Empty(t, f.DeletedManaged)
+}
+
+// GARM passes the runner name when a create failed before it got a provider
+// ID; the delete must find the VM by name or report it gone, or GARM retries
+// it forever.
+func TestDeleteByRunnerName(t *testing.T) {
+	f := migtest.New(migName)
+	m := mig.NewManager(f, "p")
+	require.NoError(t, m.Delete(context.Background(), "garm-nevercreated"), "no VM is not an error")
+	assert.Empty(t, f.DeletedManaged)
+
+	_, err := m.Create(context.Background(), runnerSpec())
+	require.NoError(t, err)
+	require.NoError(t, m.Delete(context.Background(), "garm-abcd1234"))
+	assert.Equal(t, []string{"zones/us-central1-b/instances/garm-abcd1234"}, f.DeletedManaged)
 }
 
 func TestListAndRemoveAll(t *testing.T) {

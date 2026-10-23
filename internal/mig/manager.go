@@ -222,7 +222,16 @@ func (m *Manager) Get(ctx context.Context, providerID string) (*computepb.Instan
 func (m *Manager) Delete(ctx context.Context, providerID string) error {
 	zone, name, ok := util.SplitProviderID(providerID)
 	if !ok {
-		return fmt.Errorf("invalid provider ID %q, expected zone/name", providerID)
+		// GARM passes the runner name when a create failed before returning a
+		// provider ID; find the VM by name, if it got that far.
+		found, err := m.api.ListInstances(ctx, m.project, fmt.Sprintf("name=%s", providerID))
+		if err != nil {
+			return fmt.Errorf("failed to list instances: %w", err)
+		}
+		if len(found) == 0 {
+			return nil
+		}
+		zone, name = util.ZoneFromURL(found[0].GetZone()), found[0].GetName()
 	}
 	inst, err := m.api.GetInstance(ctx, m.project, zone, name)
 	if errors.Is(err, ErrNotFound) {

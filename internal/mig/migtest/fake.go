@@ -180,10 +180,11 @@ func (f *Fake) SetLabels(_ context.Context, project, zone, name, fingerprint str
 func (f *Fake) ListInstances(_ context.Context, project, filter string) ([]*computepb.Instance, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	byLabel := strings.HasPrefix(filter, "labels.")
 	key, value, _ := strings.Cut(strings.TrimPrefix(filter, "labels."), "=")
 	var out []*computepb.Instance
 	for _, inst := range f.Instances {
-		if inst.Labels[key] == value {
+		if (byLabel && inst.Labels[key] == value) || (!byLabel && key == "name" && inst.GetName() == value) {
 			out = append(out, proto.Clone(inst).(*computepb.Instance))
 		}
 	}
