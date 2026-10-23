@@ -39,7 +39,9 @@ func TestNewRunnerSpec(t *testing.T) {
 
 	assert.Equal(t, "production-shr-large-grp", rs.MIG.Name)
 	assert.Equal(t, 15, rs.MIG.CreateTimeout())
-	assert.Equal(t, "us-central1", rs.Region, "region from provider config")
+	assert.Equal(t, []string{"us-central1"}, rs.Regions, "region from provider config")
+	assert.Equal(t, "us-central1", rs.HomeRegion)
+	assert.Equal(t, 3, rs.MIG.RegionTimeout(), "default region timeout")
 	assert.Equal(t, map[string]string{
 		"team": "ci", "garmpoolid": "pool-1", "garmcontrollerid": "ctrl-1",
 		"ostype": "linux", "garmmig": "production-shr-large-grp",
@@ -57,7 +59,17 @@ func TestRegionResolution(t *testing.T) {
 	DefaultToolFetch = fakeTools
 	rs, err := NewRunnerSpec(bootstrap(`{"mig": {"name": "g", "region": "europe-west1"}}`), "c", "us-central1")
 	require.NoError(t, err)
-	assert.Equal(t, "europe-west1", rs.Region, "extra spec overrides provider default")
+	assert.Equal(t, []string{"europe-west1"}, rs.Regions, "extra spec overrides provider default")
+
+	rs, err = NewRunnerSpec(bootstrap(`{"mig": {"name": "g", "regions": ["us-east1", "eu", "country:CA"], "region_timeout_minutes": 5}}`), "c", "us-central1")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"us-east1", "eu", "country:CA"}, rs.Regions, "selectors resolved later, against live regions")
+	assert.Equal(t, "us-central1", rs.HomeRegion)
+	assert.Equal(t, 5, rs.MIG.RegionTimeout())
+
+	rs, err = NewRunnerSpec(bootstrap(`{"mig": {"name": "g", "regions": ["us"]}}`), "c", "")
+	require.NoError(t, err, "a geography needs no default region")
+	assert.Equal(t, []string{"us"}, rs.Regions)
 
 	_, err = NewRunnerSpec(bootstrap(`{"mig": {"name": "g"}}`), "c", "")
 	assert.ErrorContains(t, err, "no region")
@@ -65,15 +77,22 @@ func TestRegionResolution(t *testing.T) {
 
 func TestExtraSpecsRejected(t *testing.T) {
 	for name, specs := range map[string]string{
-		"empty":                  ``,
-		"no mig":                 `{"disable_updates": true}`,
-		"bad mig name":           `{"mig": {"name": "Bad_Name"}}`,
-		"zone instead of region": `{"mig": {"name": "g", "region": "us-central1-a"}}`,
-		"timeout too long":       `{"mig": {"name": "g", "create_timeout_minutes": 500}}`,
-		"unknown field":          `{"mig": {"name": "g"}, "disksize": 100}`,
-		"unknown mig field":      `{"mig": {"name": "g", "zones": ["a"]}}`,
-		"reserved label":         `{"mig": {"name": "g"}, "custom_labels": {"garmpoolid": "x"}}`,
-		"bad label":              `{"mig": {"name": "g"}, "custom_labels": {"Team": "x"}}`,
+		"empty":                   ``,
+		"no mig":                  `{"disable_updates": true}`,
+		"bad mig name":            `{"mig": {"name": "Bad_Name"}}`,
+		"zone instead of region":  `{"mig": {"name": "g", "region": "us-central1-a"}}`,
+		"timeout too long":        `{"mig": {"name": "g", "create_timeout_minutes": 500}}`,
+		"region and regions":      `{"mig": {"name": "g", "region": "us-east1", "regions": ["us"]}}`,
+		"bad selector":            `{"mig": {"name": "g", "regions": ["mars"]}}`,
+		"zone selector":           `{"mig": {"name": "g", "regions": ["us-central1-a"]}}`,
+		"lowercase country":       `{"mig": {"name": "g", "regions": ["country:ca"]}}`,
+		"uppercase geography":     `{"mig": {"name": "g", "regions": ["EU"]}}`,
+		"region timeout too long": `{"mig": {"name": "g", "region_timeout_minutes": 121}}`,
+		"negative region timeout": `{"mig": {"name": "g", "region_timeout_minutes": -1}}`,
+		"unknown field":           `{"mig": {"name": "g"}, "disksize": 100}`,
+		"unknown mig field":       `{"mig": {"name": "g", "zones": ["a"]}}`,
+		"reserved label":          `{"mig": {"name": "g"}, "custom_labels": {"garmpoolid": "x"}}`,
+		"bad label":               `{"mig": {"name": "g"}, "custom_labels": {"Team": "x"}}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := ParseExtraSpecs(json.RawMessage(specs))

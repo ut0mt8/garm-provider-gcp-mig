@@ -128,8 +128,23 @@ func TestV011SchemasAndValidation(t *testing.T) {
 	assert.ErrorContains(t, p.ValidatePoolInfo(ctx, "", "", cfg, `{"mig": {"name": "missing-grp"}}`), "not found")
 	assert.Error(t, p.ValidatePoolInfo(ctx, "", "", cfg, `{"disksize": 10}`))
 
-	fake.MIGs[migName].InstanceLifecyclePolicy.DefaultActionOnFailure = proto.String("REPAIR")
+	fake.MIGs["us-central1/"+migName].InstanceLifecyclePolicy.DefaultActionOnFailure = proto.String("REPAIR")
 	assert.ErrorContains(t, p.ValidatePoolInfo(ctx, "", "", cfg, `{"mig": {"name": "`+migName+`"}}`), "DO_NOTHING")
+}
+
+func TestValidatePoolInfoMultiRegion(t *testing.T) {
+	fake, cfg := setup(t)
+	fake.RegionList = []string{"us-central1", "us-east1", "europe-west1"}
+	fake.AddMIG("us-east1", "east-only-grp", migtest.Region{Zone: "us-east1-b"})
+	p := New(cfg, "ctrl-1")
+	ctx := context.Background()
+
+	require.NoError(t, p.ValidatePoolInfo(ctx, "", "", cfg, `{"mig": {"name": "east-only-grp", "regions": ["us"]}}`), "regions without the MIG are skipped")
+	assert.ErrorContains(t, p.ValidatePoolInfo(ctx, "", "", cfg, `{"mig": {"name": "east-only-grp", "regions": ["europe"]}}`), "not found")
+	assert.ErrorContains(t, p.ValidatePoolInfo(ctx, "", "", cfg, `{"mig": {"name": "east-only-grp", "regions": ["us-south9"]}}`), "us-south9")
+
+	fake.MIGs["us-east1/east-only-grp"].UpdatePolicy.Type = proto.String("PROACTIVE")
+	assert.ErrorContains(t, p.ValidatePoolInfo(ctx, "", "", cfg, `{"mig": {"name": "east-only-grp", "regions": ["us"]}}`), "PROACTIVE")
 }
 
 func TestSchemaCommandsNeedNoCredentials(t *testing.T) {

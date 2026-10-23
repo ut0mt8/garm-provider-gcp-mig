@@ -15,6 +15,7 @@ import (
 	"github.com/cloudbase/garm-provider-common/params"
 	"github.com/cloudbase/garm-provider-common/util"
 	"github.com/invopop/jsonschema"
+	"github.com/ut0mt8/garm-provider-gcp-mig/internal/geo"
 	"github.com/xeipuuv/gojsonschema"
 )
 
@@ -25,6 +26,7 @@ const (
 	LabelMIG          = "garmmig"
 
 	defaultCreateTimeoutMinutes = 10
+	defaultRegionTimeoutMinutes = 3
 	maxCustomLabels             = 59 // GCE allows 64 labels; we set 4, the template may set some
 )
 
@@ -45,9 +47,11 @@ var (
 
 // MIG designates the regional managed instance group that creates the runners.
 type MIG struct {
-	Name                 string `json:"name" jsonschema:"description=Name of the regional managed instance group that creates the runners."`
-	Region               string `json:"region,omitempty" jsonschema:"description=Region of the MIG. Defaults to the provider config region."`
-	CreateTimeoutMinutes int    `json:"create_timeout_minutes,omitempty" jsonschema:"minimum=1,maximum=120,description=How long to wait for the MIG to create the VM before giving up. Default 10."`
+	Name                 string   `json:"name" jsonschema:"description=Name of the regional managed instance group that creates the runners."`
+	Region               string   `json:"region,omitempty" jsonschema:"description=Region of the MIG. Defaults to the provider config region."`
+	Regions              []string `json:"regions,omitempty" jsonschema:"description=Ordered location selectors tried in turn (exclusive with region): a region (us-central1)\\, a geography (us\\, northamerica\\, southamerica\\, europe\\, asia\\, australia\\, me\\, africa)\\, eu (EU member states) or country:XX (ISO code). A geography expands to its regions\\, the provider config region first. Regions without the MIG are skipped."`
+	CreateTimeoutMinutes int      `json:"create_timeout_minutes,omitempty" jsonschema:"minimum=1,maximum=120,description=How long to wait for the MIG to create the VM before giving up (in the last region). Default 10."`
+	RegionTimeoutMinutes int      `json:"region_timeout_minutes,omitempty" jsonschema:"minimum=1,maximum=120,description=How long to wait for the VM in one region before trying the next one. Default 3."`
 }
 
 // ExtraSpecs accepted by this provider. Everything about the VM itself comes
@@ -67,6 +71,13 @@ func (m *MIG) CreateTimeout() int {
 		return defaultCreateTimeoutMinutes
 	}
 	return m.CreateTimeoutMinutes
+}
+
+func (m *MIG) RegionTimeout() int {
+	if m.RegionTimeoutMinutes == 0 {
+		return defaultRegionTimeoutMinutes
+	}
+	return m.RegionTimeoutMinutes
 }
 
 // JSONSchema returns the extra specs JSON schema (published to GARM, used for validation).
@@ -104,8 +115,19 @@ func (e *ExtraSpecs) Validate() error {
 	if e.MIG.Region != "" && !regionRegex.MatchString(e.MIG.Region) {
 		return fmt.Errorf("mig.region %q is not a region (e.g. us-central1)", e.MIG.Region)
 	}
+	if e.MIG.Region != "" && len(e.MIG.Regions) > 0 {
+		return fmt.Errorf("mig.region and mig.regions are mutually exclusive")
+	}
+	for _, sel := range e.MIG.Regions {
+		if err := geo.Validate(sel); err != nil {
+			return fmt.Errorf("mig.regions: %w", err)
+		}
+	}
 	if e.MIG.CreateTimeoutMinutes < 0 || e.MIG.CreateTimeoutMinutes > 120 {
 		return fmt.Errorf("mig.create_timeout_minutes must be between 1 and 120")
+	}
+	if e.MIG.RegionTimeoutMinutes < 0 || e.MIG.RegionTimeoutMinutes > 120 {
+		return fmt.Errorf("mig.region_timeout_minutes must be between 1 and 120")
 	}
 	if len(e.CustomLabels) > maxCustomLabels {
 		return fmt.Errorf("custom_labels cannot exceed %d items", maxCustomLabels)
@@ -124,15 +146,18 @@ func (e *ExtraSpecs) Validate() error {
 	return nil
 }
 
-// Region resolves the MIG region: extra spec, else provider default.
-func (e *ExtraSpecs) Region(defaultRegion string) (string, error) {
-	if e.MIG.Region != "" {
-		return e.MIG.Region, nil
+// Regions returns the MIG location selectors: mig.regions, else mig.region,
+// else the provider default region. They are resolved at create time.
+func (e *ExtraSpecs) Regions(defaultRegion string) ([]string, error) {
+	switch {
+	case len(e.MIG.Regions) > 0:
+		return e.MIG.Regions, nil
+	case e.MIG.Region != "":
+		return []string{e.MIG.Region}, nil
+	case defaultRegion == "":
+		return nil, fmt.Errorf("no region: set mig.region or mig.regions in the extra specs, or region in the provider config")
 	}
-	if defaultRegion == "" {
-		return "", fmt.Errorf("no region: set mig.region in the extra specs or region in the provider config")
-	}
-	return defaultRegion, nil
+	return []string{defaultRegion}, nil
 }
 
 // RunnerSpec is everything needed to create one runner.
@@ -140,7 +165,8 @@ type RunnerSpec struct {
 	BootstrapParams params.BootstrapInstance
 	Tools           params.RunnerApplicationDownload
 	MIG             MIG
-	Region          string
+	Regions         []string          // location selectors, see geo.Resolve
+	HomeRegion      string            // provider config region, tried first within a geography
 	Labels          map[string]string // set on the VM after creation
 	SSHKeys         string
 	EnableBootDebug bool
@@ -152,7 +178,7 @@ func NewRunnerSpec(data params.BootstrapInstance, controllerID, defaultRegion st
 	if err != nil {
 		return nil, err
 	}
-	region, err := es.Region(defaultRegion)
+	regions, err := es.Regions(defaultRegion)
 	if err != nil {
 		return nil, err
 	}
@@ -174,7 +200,8 @@ func NewRunnerSpec(data params.BootstrapInstance, controllerID, defaultRegion st
 		BootstrapParams: data,
 		Tools:           tools,
 		MIG:             *es.MIG,
-		Region:          region,
+		Regions:         regions,
+		HomeRegion:      defaultRegion,
 		Labels:          labels,
 	}
 	for _, k := range es.SSHKeys {

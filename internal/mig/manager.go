@@ -7,7 +7,11 @@
 // runner's single-use registration). The MIG's instance template and instance
 // flexibility policy decide machine type, zone, image, disks and scheduling.
 //
-// The MIG must never act on its own (see CheckMIG): no autoscaler, default
+// With several candidate regions (mig.regions), the runner is created in the
+// first region whose MIG has capacity: a region that doesn't create the VM
+// within region_timeout_minutes is cleaned up and the next one is tried.
+//
+// The MIG must never act on its own (see MIGRegions): no autoscaler, default
 // action on VM failure DO_NOTHING, instance redistribution NONE, no
 // PROACTIVE updates.
 package mig
@@ -23,6 +27,7 @@ import (
 
 	"cloud.google.com/go/compute/apiv1/computepb"
 	"github.com/cloudbase/garm-provider-common/params"
+	"github.com/ut0mt8/garm-provider-gcp-mig/internal/geo"
 	"github.com/ut0mt8/garm-provider-gcp-mig/internal/spec"
 	"github.com/ut0mt8/garm-provider-gcp-mig/internal/util"
 )
@@ -36,6 +41,8 @@ const (
 var (
 	// PollInterval is how often the MIG is polled while a VM is being created.
 	PollInterval = 5 * time.Second
+	// TimeoutUnit is the unit of the extra specs' *_timeout_minutes (shortened in tests).
+	TimeoutUnit = time.Minute
 	// ErrNotMIGManaged means the instance exists but no regional MIG owns it.
 	ErrNotMIGManaged = errors.New("instance is not managed by a regional MIG")
 )
@@ -49,16 +56,39 @@ func NewManager(api API, project string) *Manager {
 	return &Manager{api: api, project: project}
 }
 
-// CheckMIG refuses MIGs that could act on their own and fight GARM.
-func (m *Manager) CheckMIG(ctx context.Context, region, name string) error {
-	igm, err := m.api.GetMIG(ctx, m.project, region, name)
-	if errors.Is(err, ErrNotFound) {
-		return fmt.Errorf("regional MIG %s not found in %s/%s", name, m.project, region)
+// MIGRegions resolves the location selectors (home = provider config region)
+// and returns, in order, the regions where the MIG exists. Regions without the
+// MIG are skipped; a MIG that could act on its own and fight GARM is refused.
+func (m *Manager) MIGRegions(ctx context.Context, selectors []string, home, name string) ([]string, error) {
+	candidates := selectors
+	if len(selectors) != 1 || !geo.IsRegion(selectors[0]) {
+		live, err := m.api.ListRegions(ctx, m.project)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list regions: %w", err)
+		}
+		countries := func() (map[string]string, error) { return m.api.RegionCountries(ctx, m.project) }
+		if candidates, err = geo.Resolve(selectors, live, home, countries); err != nil {
+			return nil, err
+		}
 	}
-	if err != nil {
-		return fmt.Errorf("failed to get MIG %s: %w", name, err)
+	var found []string
+	for _, region := range candidates {
+		igm, err := m.api.GetMIG(ctx, m.project, region, name)
+		if errors.Is(err, ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to get MIG %s in %s: %w", name, region, err)
+		}
+		if err := checkMIGSettings(igm); err != nil {
+			return nil, fmt.Errorf("%w (region %s)", err, region)
+		}
+		found = append(found, region)
 	}
-	return checkMIGSettings(igm)
+	if len(found) == 0 {
+		return nil, fmt.Errorf("regional MIG %s not found in %s/%s", name, m.project, strings.Join(candidates, ","))
+	}
+	return found, nil
 }
 
 func checkMIGSettings(igm *computepb.InstanceGroupManager) error {
@@ -85,9 +115,11 @@ func checkMIGSettings(igm *computepb.InstanceGroupManager) error {
 }
 
 // Create asks the MIG for one VM named after the runner, waits until it
-// exists, labels it for GARM and returns it.
+// exists, labels it for GARM and returns it. With several regions, each but
+// the last gets region_timeout_minutes before the next one is tried.
 func (m *Manager) Create(ctx context.Context, rs *spec.RunnerSpec) (*computepb.Instance, error) {
-	if err := m.CheckMIG(ctx, rs.Region, rs.MIG.Name); err != nil {
+	regions, err := m.MIGRegions(ctx, rs.Regions, rs.HomeRegion, rs.MIG.Name)
+	if err != nil {
 		return nil, err
 	}
 	name := util.InstanceName(rs.BootstrapParams.Name)
@@ -104,20 +136,52 @@ func (m *Manager) Create(ctx context.Context, rs *spec.RunnerSpec) (*computepb.I
 		metadata["ssh-keys"] = rs.SSHKeys
 	}
 
-	if err := m.api.CreateInstance(ctx, m.project, rs.Region, rs.MIG.Name, name, metadata); err != nil {
+	var errs []error
+	for i, region := range regions {
+		timeout := rs.MIG.RegionTimeout()
+		if i == len(regions)-1 {
+			timeout = rs.MIG.CreateTimeout()
+		}
+		inst, err := m.createIn(ctx, rs, region, name, metadata, time.Duration(timeout)*TimeoutUnit)
+		if err == nil {
+			return inst, nil
+		}
+		if len(regions) == 1 {
+			return nil, err
+		}
+		errs = append(errs, fmt.Errorf("%s: %w", region, err))
+		if ctx.Err() != nil {
+			break
+		}
+		if i < len(regions)-1 {
+			fmt.Fprintf(os.Stderr, "create %s in %s failed, trying %s: %v\n", name, region, regions[i+1], err)
+		}
+	}
+	return nil, fmt.Errorf("failed to create %s in any region of MIG %s: %w", name, rs.MIG.Name, errors.Join(errs...))
+}
+
+// createIn creates the runner in one region's MIG, cleaning up on failure.
+func (m *Manager) createIn(ctx context.Context, rs *spec.RunnerSpec, region, name string, metadata map[string]string, timeout time.Duration) (*computepb.Instance, error) {
+	if err := m.api.CreateInstance(ctx, m.project, region, rs.MIG.Name, name, metadata); err != nil {
+		// The operation may have stored the per-instance config anyway; the MIG
+		// would then create the VM later with the same runner registration.
+		m.cleanup(context.WithoutCancel(ctx), region, rs.MIG.Name, "", name)
 		return nil, fmt.Errorf("failed to create instance %s in MIG %s: %w", name, rs.MIG.Name, err)
 	}
 
-	zone, err := m.waitForVM(ctx, rs.Region, rs.MIG.Name, name, time.Duration(rs.MIG.CreateTimeout())*time.Minute)
+	// Attempt errors (e.g. ZONE_RESOURCE_POOL_EXHAUSTED) are normal while a
+	// flexibility policy falls back to other machine types or zones: only the
+	// timeout ends the wait.
+	zone, err := m.waitForVM(ctx, region, rs.MIG.Name, name, timeout)
 	if err != nil {
 		// Don't leave a half-created runner (or a pending per-instance config) behind.
-		m.cleanup(context.WithoutCancel(ctx), rs.Region, rs.MIG.Name, zone, name)
+		m.cleanup(context.WithoutCancel(ctx), region, rs.MIG.Name, zone, name)
 		return nil, err
 	}
 
 	inst, err := m.labelInstance(ctx, zone, name, rs.Labels)
 	if err != nil {
-		m.cleanup(context.WithoutCancel(ctx), rs.Region, rs.MIG.Name, zone, name)
+		m.cleanup(context.WithoutCancel(ctx), region, rs.MIG.Name, zone, name)
 		return nil, fmt.Errorf("failed to label instance %s: %w", name, err)
 	}
 	return inst, nil
@@ -222,7 +286,16 @@ func (m *Manager) Get(ctx context.Context, providerID string) (*computepb.Instan
 func (m *Manager) Delete(ctx context.Context, providerID string) error {
 	zone, name, ok := util.SplitProviderID(providerID)
 	if !ok {
-		return fmt.Errorf("invalid provider ID %q, expected zone/name", providerID)
+		// GARM passes the runner name when a create failed before returning a
+		// provider ID; find the VM by name, if it got that far.
+		found, err := m.api.ListInstances(ctx, m.project, fmt.Sprintf("name=%s", providerID))
+		if err != nil {
+			return fmt.Errorf("failed to list instances: %w", err)
+		}
+		if len(found) == 0 {
+			return nil
+		}
+		zone, name = util.ZoneFromURL(found[0].GetZone()), found[0].GetName()
 	}
 	inst, err := m.api.GetInstance(ctx, m.project, zone, name)
 	if errors.Is(err, ErrNotFound) {

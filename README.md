@@ -5,7 +5,7 @@ A [GARM](https://github.com/cloudbase/garm) external provider that creates GitHu
 Each runner is one VM created by a MIG, so a pool or scale set gets everything a MIG and an instance template offer:
 
 - **several machine types** behind one label (MIG instance flexibility, with preference ranks);
-- **any zone of the region** with capacity;
+- **any zone of the region** with capacity, and optionally **other regions** (`mig.regions`);
 - **Spot VMs**, GPUs, local SSDs, minimum CPU platform: anything an instance template supports.
 
 It runs **next to** the official [`garm-provider-gcp`](https://github.com/cloudbase/garm-provider-gcp), which keeps handling standalone VMs. Each pool or scale set picks one with `--provider-name`.
@@ -20,12 +20,14 @@ It runs **next to** the official [`garm-provider-gcp`](https://github.com/cloudb
 | ListInstances | VMs labelled with the pool ID and `garmmig` |
 | RemoveAllInstances | deletes every runner labelled with this controller's ID |
 | Stop / Start | on the VM |
-| ValidatePoolInfo (v0.1.1) | when a pool or scale set is created/updated: validates the extra specs **and** checks the MIG exists and is safe |
+| ValidatePoolInfo (v0.1.1) | when a pool or scale set is created/updated: validates the extra specs **and** checks the MIG exists (in at least one of its regions) and is safe |
 | Get*JSONSchema (v0.1.1) | publishes the config and extra specs schemas |
 
 Provider ID: `<zone>/<instance-name>`. Supports GARM provider interfaces **v0.1.0 and v0.1.1**.
 
 If the MIG can't create the VM within `create_timeout_minutes` (no capacity for any allowed machine type in any zone), the provider removes the pending instance and its per-instance config and returns the MIG's last error; GARM retries later.
+
+With `mig.regions`, that happens per region: a region that doesn't create the VM within `region_timeout_minutes` is cleaned up the same way and the next region is tried; the last one gets `create_timeout_minutes`. Attempt errors such as `ZONE_RESOURCE_POOL_EXHAUSTED` alone don't move on: a MIG with a flexibility policy reports them while it falls back to other machine types and zones.
 
 ## Provider config
 
@@ -54,10 +56,35 @@ credentials_file = ""      # empty = application default credentials
 |---|---|
 | `mig.name` | **required**, regional MIG name |
 | `mig.region` | defaults to the provider config `region` |
-| `mig.create_timeout_minutes` | 1–120, default 10 |
+| `mig.regions` | ordered location selectors, instead of `mig.region` (see below) |
+| `mig.create_timeout_minutes` | 1–120, default 10 (with `mig.regions`: for the last region) |
+| `mig.region_timeout_minutes` | 1–120, default 3: wait in one region before trying the next |
 | `custom_labels` | extra VM labels (the four provider labels are reserved) |
 | `ssh_keys`, `enable_boot_debug`, `disable_updates` | as in the official provider |
 | `runner_install_template`, `pre_install_scripts`, `extra_context` | cloud-init options from `garm-provider-common` |
+
+### Several regions
+
+```json
+{"mig": {"name": "production-shr-large-grp", "regions": ["us-east1", "northamerica"], "region_timeout_minutes": 3}}
+```
+
+Each selector is one of:
+
+| Selector | Regions |
+|---|---|
+| `us-central1` | that region |
+| `us` | `us-*` |
+| `northamerica` | `us-*`, `northamerica-*` (US, Canada, Mexico) |
+| `southamerica`, `europe`, `asia`, `australia`, `me`, `africa` | `southamerica-*`, `europe-*`, … (`me` = Middle East) |
+| `eu` | regions in an EU member state (as Cloud Storage's EU multi-region: not London `europe-west2` nor Zurich `europe-west6`) |
+| `country:CA` | regions in that country (ISO 3166-1 alpha-2, uppercase) |
+
+Regions are tried in selector order, without duplicates. A geography, `eu` or `country:` expands to the matching regions that are `UP`, the provider config `region` first if it matches, then alphabetically. **Regions without the MIG are skipped**, so a geography can be used while the MIG (same name) exists only in some regions; every MIG found must be safe (below). An explicit region that doesn't exist, or a selector that matches nothing, is an error.
+
+`eu` and `country:` need the Cloud Location Finder API (`cloudlocationfinder.googleapis.com`) enabled on the project and the `cloudlocationfinder.cloudLocations.list` permission.
+
+GARM's provider `exec_timeout_seconds` must exceed the worst case: (number of regions with the MIG − 1) × `region_timeout_minutes` + `create_timeout_minutes`.
 
 Anything about the VM itself (machine type, image, disks, network, service account, Spot) is **not** an extra spec: it comes from the MIG. The pool/scale set `flavor` and `image` are required by GARM but **ignored**: set descriptive values.
 
@@ -129,7 +156,7 @@ garm-cli pool add --org <ORG_ID> --provider-name gcp-mig \
 
 Scale sets: same extra specs. GARM changed how scale sets are identified towards providers in September 2026 (the pool ID stored in `garmpoolid`); **pin the GARM version and drain scale sets before upgrading GARM**.
 
-IAM for GARM's service account: `roles/compute.instanceAdmin.v1` on the project, `roles/iam.serviceAccountUser` on the runner service account.
+IAM for GARM's service account: `roles/compute.instanceAdmin.v1` on the project, `roles/iam.serviceAccountUser` on the runner service account; for `eu`/`country:` selectors, also `cloudlocationfinder.cloudLocations.list`.
 
 ## Build and release
 

@@ -155,7 +155,8 @@ func (p *Provider) GetSupportedInterfaceVersions(ctx context.Context) []string {
 }
 
 // ValidatePoolInfo runs when a pool/scale set is created or updated: it
-// checks the extra specs and that the MIG exists and is safe to drive.
+// checks the extra specs and that the MIG exists in at least one of its
+// regions and is safe to drive in all of them.
 // Image and flavor are ignored: they come from the MIG.
 func (p *Provider) ValidatePoolInfo(ctx context.Context, image, flavor, providerConfig, extraspecs string) error {
 	es, err := spec.ParseExtraSpecs(json.RawMessage(extraspecs))
@@ -168,11 +169,12 @@ func (p *Provider) ValidatePoolInfo(ctx context.Context, image, flavor, provider
 	if err := p.init(ctx); err != nil {
 		return err
 	}
-	region, err := es.Region(p.cfg.Region)
+	regions, err := es.Regions(p.cfg.Region)
 	if err != nil {
 		return err
 	}
-	return p.mgr.CheckMIG(ctx, region, es.MIG.Name)
+	_, err = p.mgr.MIGRegions(ctx, regions, p.cfg.Region, es.MIG.Name)
+	return err
 }
 
 func (p *Provider) GetConfigJSONSchema(ctx context.Context) (string, error) {
